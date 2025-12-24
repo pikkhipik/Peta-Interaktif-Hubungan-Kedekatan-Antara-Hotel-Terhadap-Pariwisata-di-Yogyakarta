@@ -1,0 +1,239 @@
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import libpysal as ps
+import esda
+from mgwr.sel_bw import Sel_BW
+from mgwr.gwr import GWR, MGWR
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+import folium
+import branca.colormap as cm
+from google.colab import files
+
+# --- FUNGSI-FUNGSI ANALISIS ---
+
+def prepare_data(file_path):
+    # Membaca file Excel
+    data = pd.read_excel(file_path)
+
+    # Pembersihan Dataset: Menghapus baris yang nilai koordinat, rating, atau jumlah ulasan kosong
+    # Menggunakan nama kolom dari dataset Tripadvisor
+    data = data.dropna(subset=['latitude', 'longitude', 'rating', 'numberOfReviews'])
+    return data
+
+def prepare_tourism_data(file_path):
+    # Membaca file CSV
+    data = pd.read_csv(file_path)
+    # Normalize column names to lowercase and strip whitespace for consistency
+    data.columns = data.columns.str.lower().str.strip()
+
+    # Pembersihan Dataset: Menghapus baris yang nilai koordinat, place_name, atau category kosong
+    required_cols_for_dropna = ['latitude', 'longitude', 'place_name', 'category']
+    # Check if essential columns are present before dropping NA values
+    for col in required_cols_for_dropna:
+        if col not in data.columns:
+            raise KeyError(f"Column '{col}' not found in tourism data after normalization. Available columns: {data.columns.tolist()}")
+
+    data = data.dropna(subset=required_cols_for_dropna)
+
+    # Ensure latitude and longitude are numeric and drop rows where conversion fails
+    data['latitude'] = pd.to_numeric(data['latitude'], errors='coerce')
+    data['longitude'] = pd.to_numeric(data['longitude'], errors='coerce')
+    data = data.dropna(subset=['latitude', 'longitude'])
+
+    return data
+
+def validate_geographic_data(dataframe):
+    # Validasi rentang koordinat khusus DIY (D.I. Yogyakarta)
+    valid_data = dataframe[
+        (dataframe['latitude'].between(-8.5, -7.3)) &
+        (dataframe['longitude'].between(109.9, 111.0))
+    ].copy()
+
+    # Konversi ke GeoDataFrame
+    gdf = gpd.GeoDataFrame(
+        valid_data,
+        geometry=gpd.points_from_xy(valid_data.longitude, valid_data.latitude),
+        crs="EPSG:4326"
+    )
+    return gdf
+
+def spatial_autocorrelation_analysis(gdf):
+    # Konstruksi pembobot spasial berdasarkan jarak (Threshold disesuaikan)
+    w = ps.weights.DistanceBand.from_dataframe(
+        gdf,
+        threshold=0.05, # Menggunakan derajat (~5km) karena CRS EPSG:4326
+        binary=False,
+        silence_warnings=True
+    )
+
+    # Analisis Moran's I untuk variabel 'rating'
+    moran_rating = esda.moran.Moran(gdf['rating'], w)
+    return {
+        'moran_index': moran_rating.I,
+        'p_value': moran_rating.p_sim,
+        'z_score': moran_rating.z_sim
+    }
+
+def geographically_weighted_regression(gdf):
+    # Variabel Koordinat
+    coor = gdf[['latitude', 'longitude']].values
+    # Variabel Dependen (Y): Rating
+    y = gdf['rating'].values.reshape(-1, 1)
+    # Variabel Independen (X): Jumlah Ulasan (numberOfReviews)
+    X = gdf[['numberOfReviews']].values
+
+    # Mencari bandwidth optimal
+    selector = Sel_BW(coor, y, X, multi=True, constant=True)
+    selector.search()
+
+    # Menjalankan model GWR (Multiscale)
+    gwr_model = MGWR(coor, y, X, selector).fit()
+    return {
+        'local_coefficients': gwr_model.params,
+        'model_summary': gwr_model.summary()
+    }
+
+def spatial_rating_clustering(gdf):
+    # Fitur untuk clustering: Lokasi + Rating + Jumlah Ulasan
+    features = gdf[['longitude', 'latitude', 'rating', 'numberOfReviews']]
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+
+    # DBSCAN Clustering
+    dbscan = DBSCAN(eps=0.3, min_samples=5)
+    gdf['cluster'] = dbscan.fit_predict(features_scaled)
+
+    cluster_stats = gdf.groupby('cluster').agg({
+        'rating': ['mean', 'count'],
+        'numberOfReviews': ['mean']
+    })
+    return {'clustered_data': gdf, 'cluster_statistics': cluster_stats}
+
+def assign_proximity_colors(gdf_hotels, gdf_tourism):
+    if gdf_tourism.empty:
+        print("No tourism data available to calculate proximity. Assigning default color.")
+        gdf_hotels['proximity_color'] = 'gray'
+        gdf_hotels['proximity_distance_m'] = np.nan
+        return gdf_hotels
+
+    # Reproject to a projected CRS for accurate distance calculations (UTM Zone 49S for Yogyakarta)
+    hotels_proj = gdf_hotels.to_crs(epsg=32749)
+    tourism_proj = gdf_tourism.to_crs(epsg=32749)
+
+    # Calculate distance from each hotel to the nearest tourism spot
+    # Use sjoin_nearest for more efficient nearest neighbor search
+    # Perform a nearest join to get the closest tourism point for each hotel
+    joined = hotels_proj.sjoin_nearest(tourism_proj, how="left", max_distance=100000, distance_col="distance_to_tourism")
+
+    # The distance_to_tourism is for the nearest tourism point
+    # If a hotel has no nearby tourism points within the max_distance, it might be NaN, handle this
+    gdf_hotels['proximity_distance_m'] = joined['distance_to_tourism'].values
+
+    # Define color based on proximity (thresholds in meters)
+    def get_proximity_color(distance_m):
+        if pd.isna(distance_m) or distance_m > 5000: # Jauh (more than 5km or no tourism point found)
+            return 'red'
+        elif distance_m <= 1000:  # Dekat (within 1 km)
+            return 'green'
+        elif distance_m <= 5000: # Sedang (between 1 km and 5 km)
+            return 'yellow'
+        return 'gray' # Fallback color
+
+    gdf_hotels['proximity_color'] = gdf_hotels['proximity_distance_m'].apply(get_proximity_color)
+    return gdf_hotels
+
+def create_interactive_rating_map(gdf, tourism_gdf=None):
+    map_center = gdf[['latitude', 'longitude']].mean()
+    m = folium.Map(location=[map_center.latitude, map_center.longitude], zoom_start=12)
+
+    # Tambahkan basemap OpenStreetMap
+    folium.TileLayer('OpenStreetMap').add_to(m)
+
+    # Statistik Legend untuk Hotel (berdasarkan jarak ke pariwisata)
+    count_green = len(gdf[gdf['proximity_color'] == 'green'])
+    count_yellow = len(gdf[gdf['proximity_color'] == 'yellow'])
+    count_red = len(gdf[gdf['proximity_color'] == 'red'])
+
+    legend_html = f"""
+    <div style="position: fixed; bottom: 50px; left: 50px; width: 220px; z-index:9999; font-size:12px;
+    background-color:white; opacity:0.9; padding: 10px; border-radius: 5px; box-shadow: 3px 3px 3px rgba(0,0,0,0.2);
+    font-family: Arial, sans-serif; border:2px solid grey;">
+        <b>Proximity Hotel ke Pariwisata</b><br><hr style="margin: 5px 0;">
+        <div style="margin-bottom: 3px;"><span style="color:green; font-size:14px;">●</span> <b>Dekat (<1km)</b>: <b>{count_green}</b> Hotel</div>
+        <div style="margin-bottom: 3px;"><span style="color:gold; font-size:14px;">●</span> <b>Sedang (1-5km)</b>: <b>{count_yellow}</b> Hotel</div>
+        <div style="margin-bottom: 3px;"><span style="color:red; font-size:14px;">●</span> <b>Jauh (>5km)</b>: <b>{count_red}</b> Hotel</div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    for _, row in gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.latitude, row.longitude],
+            radius=5,
+            popup=f"<b>{row['name']}</b><br>Rating: {row['rating']}<br>Proximity: {row['proximity_distance_m']:.2f} m",
+            color=row['proximity_color'], # Use proximity color
+            fill=True, fill_opacity=0.7, weight=1
+        ).add_to(m)
+
+    # Tambahkan lokasi pariwisata jika tersedia
+    if tourism_gdf is not None:
+        for _, row in tourism_gdf.iterrows():
+            # Use normalized column names
+            popup_text = f"<b>{row['place_name']}</b><br>Kategori: {row['category']}"
+            if 'rating' in row and pd.notna(row['rating']): # Check for 'rating' (lowercase)
+                popup_text += f"<br>Rating: {row['rating']}"
+
+            folium.Marker(
+                location=[row.latitude, row.longitude],
+                popup=popup_text,
+                icon=folium.Icon(color='blue', icon='camera') # Menggunakan ikon kamera untuk pariwisata
+            ).add_to(m)
+    return m
+
+# --- EKSEKUSI ---
+
+# Masukkan nama file Excel untuk data hotel/tripadvisor Anda di sini
+path_file = '/content/drive/MyDrive/Propas/dataset_tripadvisor_2022-11-08_07-29-38-862.xlsx'
+# Masukkan nama file CSV untuk data pariwisata Anda di sini
+tour_path_file = '/content/drive/MyDrive/Propas/tour.csv'
+
+try:
+    print("Memproses data hotel/tripadvisor...")
+    raw_data = prepare_data(path_file)
+    gdf = validate_geographic_data(raw_data)
+    print(f"Data hotel/tripadvisor valid ditemukan: {len(gdf)} titik.")
+
+    print(f"\nMemproses data pariwisata dari: {tour_path_file}")
+    raw_tourism_data = prepare_tourism_data(tour_path_file)
+    tourism_gdf = validate_geographic_data(raw_tourism_data) # Reusing validate_geographic_data
+    print(f"Data pariwisata valid ditemukan: {len(tourism_gdf)} titik.")
+
+    print("\n--- Analisis Autokorelasi Spasial ---")
+    moran_res = spatial_autocorrelation_analysis(gdf)
+    print(f"Moran's I Index: {moran_res['moran_index']:.4f}")
+    print(f"P-Value: {moran_res['p_value']} (Signifikan jika < 0.05)")
+
+    print("\n--- Menjalankan GWR ---")
+    gwr_res = geographically_weighted_regression(gdf)
+    print(gwr_res['model_summary'])
+
+    print("\n--- Clustering DBSCAN ---")
+    cluster_res = spatial_rating_clustering(gdf)
+    print(cluster_res['cluster_statistics'])
+
+    print("\n--- Menentukan Proximity Hotel ke Pariwisata ---")
+    gdf = assign_proximity_colors(gdf, tourism_gdf)
+    print("Proximity warna untuk hotel berhasil ditetapkan.")
+
+    print("\n--- Membuat Peta Interaktif ---")
+    final_map = create_interactive_rating_map(gdf, tourism_gdf)
+    final_map.save('hasil_analisis_tripadvisor.html')
+    print("Peta berhasil disimpan sebagai 'hasil_analisis_tripadvisor.html'")
+
+    # Menampilkan peta di notebook
+    display(final_map)
+
+except Exception as e:
+    print(f"Terjadi kesalahan: {e}")
